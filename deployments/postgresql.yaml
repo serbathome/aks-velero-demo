@@ -1,18 +1,12 @@
 # Demo only: the LoadBalancer exposes PostgreSQL to all IPv4 clients without TLS.
 # Deploy only on the source cluster; do not pre-create an empty database on the
 # destination before restoring.
-# kubectl --context source-cluster-hkykf apply -f .\deployments\postgresql.yaml
 # Username: demo; database: demo. Retrieve the generated password with:
-# kubectl --context source-cluster-hkykf -n postgres-demo exec postgresql-0 -c postgres -- cat /var/lib/postgresql/data/.postgres-password
-# Get the public IP with:
-# kubectl --context source-cluster-hkykf -n postgres-demo get service postgresql
 #
 # Both clusters need Velero node agents, Kopia repository access/credentials,
 # CSI support (EnableCSI), and the AKS managed-csi StorageClass.
 # Pause client writes before the backup and wait for every DataUpload to complete.
 # Use CSI snapshot data movement, not a live file-system backup of PGDATA:
-# velero --kubecontext source-cluster-hkykf backup create postgresql-migration --include-namespaces postgres-demo --snapshot-move-data --default-volumes-to-fs-backup=false --wait
-# velero --kubecontext destination-cluster-hkykf restore create postgresql-migration --from-backup postgresql-migration --wait
 # The snapshot includes PGDATA, WAL and the password file on the same Azure Disk.
 # PostgreSQL performs crash recovery on startup; writes after the snapshot are
 # not included. Verify the restored database before deleting the source or backup.
