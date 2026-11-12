@@ -1,0 +1,203 @@
+# Demo only: the LoadBalancer exposes PostgreSQL to all IPv4 clients without TLS.
+# Deploy only on the source cluster; do not pre-create an empty database on the
+# destination before restoring.
+# kubectl --context source-cluster-hkykf apply -f .\deployments\postgresql.yaml
+# Username: demo; database: demo. Retrieve the generated password with:
+# kubectl --context source-cluster-hkykf -n postgres-demo exec postgresql-0 -c postgres -- cat /var/lib/postgresql/data/.postgres-password
+# Get the public IP with:
+# kubectl --context source-cluster-hkykf -n postgres-demo get service postgresql
+#
+# Both clusters need Velero node agents, Kopia repository access/credentials,
+# CSI support (EnableCSI), and the AKS managed-csi StorageClass.
+# Pause client writes before the backup and wait for every DataUpload to complete.
+# Use CSI snapshot data movement, not a live file-system backup of PGDATA:
+# velero --kubecontext source-cluster-hkykf backup create postgresql-migration --include-namespaces postgres-demo --snapshot-move-data --default-volumes-to-fs-backup=false --wait
+# velero --kubecontext destination-cluster-hkykf restore create postgresql-migration --from-backup postgresql-migration --wait
+# The snapshot includes PGDATA, WAL and the password file on the same Azure Disk.
+# PostgreSQL performs crash recovery on startup; writes after the snapshot are
+# not included. Verify the restored database before deleting the source or backup.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres-demo
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: postgresql-azure-disk
+driver: disk.csi.azure.com
+deletionPolicy: Delete
+parameters:
+  incremental: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-headless
+  namespace: postgres-demo
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgresql
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: postgres-demo
+spec:
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+    - 0.0.0.0/0
+  selector:
+    app.kubernetes.io/name: postgresql
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: postgres-demo
+spec:
+  serviceName: postgresql-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgresql
+    spec:
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: initialize-password
+          image: postgres:17-bookworm
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              umask 077
+              file=/var/lib/postgresql/data/.postgres-password
+              if [ ! -s "$file" ]; then
+                password="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+                if [ "${#password}" -ne 64 ]; then
+                  echo "Failed to generate the PostgreSQL password." >&2
+                  exit 1
+                fi
+                printf '%s\n' "$password" > "$file.tmp"
+                mv "$file.tmp" "$file"
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:17-bookworm
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: demo
+            - name: POSTGRES_DB
+              value: demo
+            - name: POSTGRES_PASSWORD_FILE
+              value: /var/lib/postgresql/data/.postgres-password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_INITDB_ARGS
+              value: --data-checksums --auth-host=scram-sha-256
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: scram-sha-256
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - demo
+                - -d
+                - demo
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - demo
+                - -d
+                - demo
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - demo
+                - -d
+                - demo
+            periodSeconds: 10
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        annotations:
+          velero.io/csi-volumesnapshot-class: postgresql-azure-disk
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: managed-csi
+        resources:
+          requests:
+            storage: 10Gi
